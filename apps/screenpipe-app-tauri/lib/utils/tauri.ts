@@ -11,6 +11,14 @@ async openPermissionSettings(permission: OSPermission) : Promise<void> {
 async requestPermission(permission: OSPermission) : Promise<void> {
     await TAURI_INVOKE("request_permission", { permission });
 },
+async resetAndRequestPermission(permission: OSPermission) : Promise<Result<void, string>> {
+    try {
+        return { status: "ok", data: await TAURI_INVOKE("reset_and_request_permission", { permission }) };
+    } catch (e) {
+        if(e instanceof Error) throw e;
+        else return { status: "error", error: e as any };
+    }
+},
 async doPermissionsCheck(initialCheck: boolean) : Promise<OSPermissionsCheck> {
     return await TAURI_INVOKE("do_permissions_check", { initialCheck });
 },

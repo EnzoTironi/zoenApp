@@ -72,8 +72,7 @@ export function UpdateBanner({ className, compact = false }: UpdateBannerProps) 
         // Get or check for the update
         let update = pendingUpdate;
         if (!update) {
-          const cpuArch = arch();
-          const endpoint = `https://cdn.crabnebula.app/update/mediar/screenpipe/windows-${cpuArch}/{{current_version}}`;
+          const endpoint = "https://github.com/screenpipe/screenpipe/releases/latest/download/latest.json";
           update = await check({ endpoints: [endpoint] } as any);
         }
 

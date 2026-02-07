@@ -2,12 +2,12 @@ import { check } from "@tauri-apps/plugin-updater";
 import { ask, message } from "@tauri-apps/plugin-dialog";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { invoke } from "@tauri-apps/api/core";
-import { platform, arch } from "@tauri-apps/plugin-os";
+import { platform } from "@tauri-apps/plugin-os";
 import type { UpdateChannel } from "@/lib/hooks/use-settings";
 
 const UPDATE_ENDPOINTS = {
-  stable: "https://cdn.crabnebula.app/update/mediar/screenpipe",
-  beta: "https://cdn.crabnebula.app/update/mediar/screenpipe-beta",
+  stable: "https://github.com/screenpipe/screenpipe/releases/latest/download/latest.json",
+  beta: "https://github.com/screenpipe/screenpipe/releases/download/v{{current_version}}/latest-beta.json",
 } as const;
 
 export async function checkForAppUpdates({
@@ -18,12 +18,9 @@ export async function checkForAppUpdates({
   channel?: UpdateChannel;
 }) {
   const os = platform();
-  const cpuArch = arch();
 
   // Build the endpoint URL for the selected channel
-  const baseEndpoint = UPDATE_ENDPOINTS[channel];
-  const target = os === "macos" ? "darwin" : os;
-  const endpoint = `${baseEndpoint}/${target}-${cpuArch}/{{current_version}}`;
+  const endpoint = UPDATE_ENDPOINTS[channel];
 
   // @ts-ignore - endpoints option may not be in type definitions but is supported
   const update = await check({

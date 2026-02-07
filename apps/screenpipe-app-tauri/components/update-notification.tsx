@@ -17,36 +17,41 @@ const UpdateNotification: React.FC<{ checkIntervalHours: number }> = ({
       ) {
         const os = platform();
         const releasePageUrl =
-          "https://web.crabnebula.cloud/mediar/screenpipe/releases";
+          "https://github.com/screenpipe/screenpipe/releases/latest";
 
         try {
-          const response = await fetch(releasePageUrl);
-          const html = await response.text();
+          // Get the latest release info from GitHub API
+          const apiUrl = "https://api.github.com/repos/screenpipe/screenpipe/releases/latest";
+          const response = await fetch(apiUrl);
+          const release = await response.json();
 
-          // Extract download links
-          const links =
-            html.match(
-              /https:\/\/cdn\.crabnebula\.app\/download\/mediar\/screenpipe\/latest[^\s"']*/g
-            ) || [];
+          if (!release.assets) {
+            console.error("No assets found in release");
+            return;
+          }
+
+          // Extract download links from release assets
+          const assets = release.assets.map((asset: any) => asset.browser_download_url);
 
           let downloadLink = "";
           if (os === "windows") {
             downloadLink =
-              links.find((link) => link.includes("nsis-x86_64")) || "";
+              assets.find((link: string) => link.includes("nsis") || link.includes(".exe")) || "";
           } else if (os === "macos") {
-            // For macOS, we can't determine ARM vs Intel, so we'll provide both options
+            // For macOS, provide both ARM and Intel options
             const armLink =
-              links.find((link) => link.includes("aarch64.dmg")) || "";
+              assets.find((link: string) => link.includes("aarch64") && link.includes(".dmg")) || "";
             const intelLink =
-              links.find((link) => link.includes("x64.dmg")) || "";
-            downloadLink = `ARM: ${armLink}\nIntel: ${intelLink}`;
+              assets.find((link: string) => link.includes("x86_64") && link.includes(".dmg")) || "";
+            if (armLink || intelLink) {
+              downloadLink = `Download: ${releasePageUrl}`;
+            }
           }
 
           if (downloadLink) {
             sendNotification({
               title: "Screenpipe Update Available",
-              body: `A new version of Screenpipe is available. Click to download:\n${downloadLink}`,
-              //   icon: "update-icon", // Replace with your update icon
+              body: `A new version of Screenpipe is available. ${downloadLink}`,
             });
           }
         } catch (error) {
