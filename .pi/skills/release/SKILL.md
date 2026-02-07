@@ -120,12 +120,12 @@ gh run view <RUN_ID> --json status,conclusion,jobs --jq '{status: .status, concl
 ```
 
 ### 7. Test the Draft Release
-- Download from CrabNebula Cloud: https://web.crabnebula.cloud/mediar/screenpipe/releases
+- Download from GitHub Releases: https://github.com/screenpipe/screenpipe/releases
 - Test on macOS and Windows
 - Verify updater artifacts exist (.tar.gz, .sig files)
 
 ### 8. Publish Release
-After testing, publish manually via CrabNebula Cloud dashboard, OR commit with magic words:
+After testing, publish manually via GitHub Releases (edit draft and publish), OR commit with magic words:
 ```bash
 git commit --allow-empty -m "release-app-publish" && git push
 ```
