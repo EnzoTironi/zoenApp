@@ -195,22 +195,30 @@ pub async fn sync_init(
                     // Auto-download from other devices after upload
                     let end = chrono::Utc::now();
                     let start = end - chrono::Duration::hours(24);
-                    match sync_manager_for_events.download_by_time_range(
-                        Some(start.to_rfc3339()),
-                        Some(end.to_rfc3339()),
-                        None,
-                        Some(100),
-                    ).await {
+                    match sync_manager_for_events
+                        .download_by_time_range(
+                            Some(start.to_rfc3339()),
+                            Some(end.to_rfc3339()),
+                            None,
+                            Some(100),
+                        )
+                        .await
+                    {
                         Ok(blobs) if !blobs.is_empty() => {
                             info!("downloaded {} blobs from other devices", blobs.len());
                             let mut imported = 0;
                             for blob in blobs {
-                                let chunk: Result<crate::sync_provider::SyncChunk, _> = serde_json::from_slice(&blob.data);
+                                let chunk: Result<crate::sync_provider::SyncChunk, _> =
+                                    serde_json::from_slice(&blob.data);
                                 match chunk {
                                     Ok(chunk) => {
                                         match sync_provider_for_events.import_chunk(&chunk).await {
                                             Ok(result) => {
-                                                imported += result.imported_frames + result.imported_ocr + result.imported_transcriptions + result.imported_accessibility + result.imported_ui_events;
+                                                imported += result.imported_frames
+                                                    + result.imported_ocr
+                                                    + result.imported_transcriptions
+                                                    + result.imported_accessibility
+                                                    + result.imported_ui_events;
                                             }
                                             Err(e) => error!("failed to import chunk: {}", e),
                                         }

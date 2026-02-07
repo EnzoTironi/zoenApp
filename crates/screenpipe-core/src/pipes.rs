@@ -1,4 +1,5 @@
 use dirs::home_dir;
+#[cfg(feature = "security")]
 use regex::Regex;
 use sentry;
 use serde_json::Value;
@@ -110,8 +111,14 @@ pub fn sanitize_pipe_name(name: &str) -> String {
     }
 
     // Fall back to original sanitization logic for non-GitHub URLs
-    let re = Regex::new(r"[^a-zA-Z0-9_-]").unwrap();
-    let sanitized = re.replace_all(name, "-").to_string();
+    #[cfg(feature = "security")]
+    let sanitized = {
+        let re = Regex::new(r"[^a-zA-Z0-9_-]").unwrap();
+        re.replace_all(name, "-").to_string()
+    };
+
+    #[cfg(not(feature = "security"))]
+    let sanitized = name.replace(|c: char| !c.is_alphanumeric() && c != '_' && c != '-', "-");
 
     // Remove "-ref-main/" suffix if it exists
     sanitized
