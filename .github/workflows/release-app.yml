@@ -48,7 +48,7 @@ jobs:
           else
             echo "should_publish=false" >> $GITHUB_OUTPUT
           fi
-          
+
           # Check for explicit testing or skip flags first
           if echo "$COMMIT_MSG" | grep -q "release-app"; then
             echo "should_test=true" >> $GITHUB_OUTPUT
@@ -107,11 +107,23 @@ jobs:
             sed -i 's/^version = ".*"/version = "${{ github.event.inputs.version }}"/' apps/screenpipe-app-tauri/src-tauri/Cargo.toml
           fi
 
-      - name: create draft release
-        uses: crabnebula-dev/cloud-release@v0.2.6
+      - name: Get version from Cargo.toml
+        id: get_version
+        run: |
+          VERSION=$(grep '^version = ' apps/screenpipe-app-tauri/src-tauri/Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Create Draft Release
+        uses: softprops/action-gh-release@v2
         with:
-          command: release draft ${{ secrets.CN_APP_SLUG }} --framework tauri
-          api-key: ${{ secrets.CN_API_KEY }}
+          tag_name: v${{ env.VERSION }}
+          name: v${{ env.VERSION }}
+          draft: true
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   publish-tauri:
     needs: [check_commit, draft]
@@ -234,23 +246,22 @@ jobs:
           echo "$env:USERPROFILE\.cargo\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           rustc --version # verify rust is available
 
-      # sccache disabled temporarily due to GitHub Actions cache outage
-      # - name: Setup sccache
-      #   uses: mozilla-actions/sccache-action@v0.0.7
-      #   with:
-      #     version: "v0.8.2"
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.7
+        with:
+          version: "v0.8.2"
 
-      # - name: Configure sccache
-      #   shell: bash
-      #   run: |
-      #     echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
-      #     echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+      - name: Configure sccache
+        shell: bash
+        run: |
+          echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
+          echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
 
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
         with:
-          # Specify custom cache key
-          key: ${{ runner.os }}-rust-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          # Specify custom cache key with platform and target for better isolation
+          key: ${{ runner.os }}-${{ matrix.target }}-rust-${{ hashFiles('**/Cargo.lock') }}
           # Cache these paths
           cache-directories: |
             ~/.cargo/registry/index/
@@ -272,9 +283,9 @@ jobs:
             ~/.cargo/.crates2.json
             target/${{ matrix.target }}/release
             apps/screenpipe-app-tauri/src-tauri/target/release
-          key: ${{ runner.os }}-artifacts-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ matrix.target }}-artifacts-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-artifacts-${{ matrix.target }}-
+            ${{ runner.os }}-${{ matrix.target }}-artifacts-
 
       - name: Cache Homebrew packages
         if: matrix.platform == 'macos-latest'
@@ -647,76 +658,106 @@ jobs:
           echo "Uploading debug symbols to Sentry..."
           sentry-cli debug-files upload --org $SENTRY_ORG --project screenpipe-app apps/screenpipe-app-tauri/src-tauri/target/${{ matrix.target }}/release/
 
-      - name: Download and Run CLI Manually (Windows)
+      - name: Upload Assets to GitHub Release (Windows)
         if: matrix.os_type == 'windows'
         shell: powershell
         env:
-          CN_API_KEY: ${{ secrets.CN_API_KEY }}
-          CN_VERBOSE: "2"
-          USER_AGENT: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-          MAX_RETRIES: 5
-          RETRY_DELAY: 30
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # create temp directory for cli
-          $cliDir = Join-Path $Env:GITHUB_WORKSPACE "cn-cli-temp"
-          New-Item -ItemType Directory -Force -Path $cliDir
+          # Find the built artifacts
+          $tauriDir = "apps/screenpipe-app-tauri/src-tauri"
+          $targetDir = "$tauriDir/target/${{ matrix.target }}/release/bundle"
 
-          # download cli
-          $cliUrl = "https://cdn.crabnebula.app/download/crabnebula/cn-cli/latest/platform/windows-binary-x86_64"
-          $cliExe = Join-Path $cliDir "cn.exe"
-          Write-Host "downloading crabnebula cli..."
-          Invoke-WebRequest -Uri $cliUrl -UserAgent $env:USER_AGENT -OutFile $cliExe
-
-          # move to the directory we want to upload from
-          cd apps/screenpipe-app-tauri/src-tauri
-
-          # upload assets with retry logic
-          $cliFullPath = Join-Path $cliDir "cn.exe"
-          Write-Host "uploading assets from $(pwd) using $cliFullPath..."
-
-          $attempt = 1
-          $success = $false
-
-          while (-not $success -and $attempt -le $env:MAX_RETRIES) {
-            Write-Host "Attempt $attempt of $env:MAX_RETRIES"
-            try {
-              & $cliFullPath release upload ${{ secrets.CN_APP_SLUG }} --framework tauri -vv
-              if ($LASTEXITCODE -eq 0) {
-                $success = $true
-                Write-Host "Upload successful!"
-              } else {
-                throw "CLI returned exit code $LASTEXITCODE"
-              }
-            } catch {
-              Write-Host "Error during attempt $attempt`: $_"
-              if ($attempt -lt $env:MAX_RETRIES) {
-                Write-Host "Waiting $env:RETRY_DELAY seconds before retry..."
-                Start-Sleep -Seconds $env:RETRY_DELAY
-              }
-            }
-            $attempt++
+          # Get version
+          $version = "${{ env.VERSION }}"
+          if (-not $version) {
+            $cargoContent = Get-Content "$tauriDir/Cargo.toml"
+            $version = ($cargoContent | Select-String '^version = "(.*)"').Matches.Groups[1].Value
           }
 
-          if (-not $success) {
-            Write-Host "Failed to upload after $env:MAX_RETRIES attempts"
-            exit 1
+          # Collect artifacts to upload
+          $artifacts = @()
+
+          # MSI installer
+          $msi = Get-ChildItem -Path $targetDir/msi -Filter "*.msi" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($msi) {
+            $artifacts += $msi.FullName
+            # Also find the .msi.zip and .msi.zip.sig files
+            $msiZip = Get-ChildItem -Path $targetDir/msi -Filter "*.msi.zip" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($msiZip) { $artifacts += $msiZip.FullName }
+            $msiSig = Get-ChildItem -Path $targetDir/msi -Filter "*.msi.zip.sig" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($msiSig) { $artifacts += $msiSig.FullName }
           }
 
-      - name: Upload Assets to CrabNebula Cloud (Non-Windows)
-        if: matrix.os_type != 'windows'
-        uses: crabnebula-dev/cloud-release@v0.2.6
+          # NSIS installer
+          $nsis = Get-ChildItem -Path $targetDir/nsis -Filter "*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($nsis) { $artifacts += $nsis.FullName }
+
+          Write-Host "Found artifacts:"
+          $artifacts | ForEach-Object { Write-Host "  $_" }
+
+          # Upload using gh CLI
+          foreach ($artifact in $artifacts) {
+            Write-Host "Uploading $artifact..."
+            gh release upload "v$version" $artifact --clobber
+          }
+
+      - name: Upload Assets to GitHub Release (macOS)
+        if: matrix.os_type == 'macos'
+        shell: bash
         env:
-          CN_VERBOSE: "2"
-        with:
-          command: release upload ${{ secrets.CN_APP_SLUG }} --framework tauri -vv
-          api-key: ${{ secrets.CN_API_KEY }}
-          path: ./apps/screenpipe-app-tauri/src-tauri
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAURI_DIR="apps/screenpipe-app-tauri/src-tauri"
+          TARGET_DIR="$TAURI_DIR/target/${{ matrix.target }}/release/bundle"
+
+          # Get version
+          VERSION="${{ env.VERSION }}"
+          if [ -z "$VERSION" ]; then
+            VERSION=$(grep '^version = ' "$TAURI_DIR/Cargo.toml" | sed 's/version = "\(.*\)"/\1/')
+          fi
+
+          # Collect artifacts
+          ARTIFACTS=()
+
+          # DMG
+          if [ -d "$TARGET_DIR/dmg" ]; then
+            for f in "$TARGET_DIR/dmg"/*.dmg; do
+              [ -f "$f" ] && ARTIFACTS+=("$f")
+            done
+          fi
+
+          # App tarball (for updater)
+          if [ -d "$TARGET_DIR/macos" ]; then
+            for f in "$TARGET_DIR/macos"/*.tar.gz; do
+              [ -f "$f" ] && ARTIFACTS+=("$f")
+            done
+            for f in "$TARGET_DIR/macos"/*.tar.gz.sig; do
+              [ -f "$f" ] && ARTIFACTS+=("$f")
+            done
+          fi
+
+          # App bundle
+          if [ -d "$TARGET_DIR/macos" ]; then
+            for f in "$TARGET_DIR/macos"/*.app; do
+              [ -d "$f" ] && ARTIFACTS+=("$f")
+            done
+          fi
+
+          echo "Found artifacts:"
+          printf '  %s\n' "${ARTIFACTS[@]}"
+
+          # Upload using gh CLI
+          for artifact in "${ARTIFACTS[@]}"; do
+            echo "Uploading $artifact..."
+            gh release upload "v$VERSION" "$artifact" --clobber
+          done
 
   publish-release:
     needs: [check_commit, publish-tauri]
     # Only auto-publish when commit message contains "release-app-publish"
     # workflow_dispatch builds only create drafts - publish manually after testing
-    if: needs.check_commit.outputs.should_publish == 'true' && (needs.publish-tauri.result == 'success' || needs.retry-win.result == 'success')
+    if: needs.check_commit.outputs.should_publish == 'true' && needs.publish-tauri.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -729,40 +770,55 @@ jobs:
           VERSION=$(grep '^version = ' apps/screenpipe-app-tauri/src-tauri/Cargo.toml | sed 's/version = "\(.*\)"/\1/')
           echo "VERSION=$VERSION" >> $GITHUB_ENV
 
-      - name: Publish Release on CrabNebula Cloud
-        uses: crabnebula-dev/cloud-release@v0.2.6
-        with:
-          command: release publish ${{ secrets.CN_APP_SLUG }} ${{ env.VERSION }}
-          api-key: ${{ secrets.CN_API_KEY }}
+      - name: Generate Update Manifest
+        run: |
+          # Create dist directory with signature files from all platforms
+          mkdir -p dist
 
-      - name: Also publish Beta release
-        uses: crabnebula-dev/cloud-release@v0.2.6
-        continue-on-error: true
-        with:
-          command: release publish ${{ secrets.CN_APP_SLUG_BETA }} ${{ env.VERSION }}
-          api-key: ${{ secrets.CN_API_KEY }}
-          
+          # Download artifacts from GitHub release
+          gh release download "v${{ env.VERSION }}" --pattern "*.sig" --dir dist/ || true
+
+          # Generate the update manifest
+          VERSION="${{ env.VERSION }}" \
+          GITHUB_REPOSITORY_OWNER="${{ github.repository_owner }}" \
+          GITHUB_REPOSITORY_NAME="${{ github.event.repository.name }}" \
+          DIST_DIR="dist" \
+          OUTPUT_FILE="latest.json" \
+          node scripts/generate-update-manifest.js
+
+          # Upload the manifest to the release
+          gh release upload "v${{ env.VERSION }}" latest.json --clobber
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish Release
+        run: |
+          # Publish the draft release
+          gh release edit "v${{ env.VERSION }}" --draft=false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Create testing notification
         if: needs.check_commit.outputs.should_test == 'true'
         uses: actions/github-script@v6
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            // Get CrabNebula release URL from environment
-            const releaseUrl = "https://web.crabnebula.cloud/mediar/screenpipe/releases";
-            
+            // Get GitHub release URL
+            const releaseUrl = `https://github.com/${{ github.repository }}/releases/tag/v${{ env.VERSION }}`;
+
             // Create release discussion issue
             const message = `
             ## 🧪 testing needed for v${{ env.VERSION }}
-            
+
             this release needs community testing. a testing bounty issue will be created shortly.
-            
-            - download the release: [crabnebula cloud](${ releaseUrl })
+
+            - download the release: [github releases](${ releaseUrl })
             - testing guidelines: [testing.md](https://github.com/screenpipe/screenpipe/blob/main/TESTING.md)
-            
+
             each tester who provides quality feedback will receive a $20 bounty through algora.
             `;
-            
+
             // Create a new issue for testing discussion
             const issue = await github.rest.issues.create({
               owner: context.repo.owner,
@@ -771,7 +827,7 @@ jobs:
               body: message,
               labels: ['testing', 'discussion']
             });
-            
+
             console.log(`Created testing discussion issue: ${issue.data.html_url}`);
 
   generate-changelog:
