@@ -16,6 +16,10 @@ on:
         description: "Whether this release needs community testing"
         type: boolean
         default: false
+      force_github_runners:
+        description: "Force GitHub-hosted runners (skip self-hosted even if online)"
+        type: boolean
+        default: false
   push:
     branches: [main]
 
@@ -67,26 +71,34 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.RUNNER_CHECK_TOKEN }}
         run: |
-          # Check if any self-hosted runner with macos-26 label is online
-          RUNNER_STATUS=$(gh api repos/${{ github.repository }}/actions/runners \
-            --jq '.runners[] | select(.labels[].name == "macos-26") | .status' 2>/dev/null || echo "offline")
-          if [ "$RUNNER_STATUS" = "online" ]; then
-            echo "macos26_runner=macos-26" >> $GITHUB_OUTPUT
-            echo "✅ Self-hosted macOS 26 runner is online"
-          else
+          # Force GitHub-hosted runners if requested
+          if [ "${{ github.event.inputs.force_github_runners }}" = "true" ]; then
             echo "macos26_runner=macos-latest" >> $GITHUB_OUTPUT
-            echo "ℹ️ Self-hosted macOS 26 runner offline — falling back to macos-latest"
-          fi
-
-          # Check if Windows self-hosted runner is online
-          WIN_RUNNER_STATUS=$(gh api repos/${{ github.repository }}/actions/runners \
-            --jq '.runners[] | select(.labels[].name == "windows-desktop-test") | .status' 2>/dev/null || echo "offline")
-          if [ "$WIN_RUNNER_STATUS" = "online" ]; then
-            echo "windows_runner=windows-desktop-test" >> $GITHUB_OUTPUT
-            echo "✅ Self-hosted Windows runner is online"
-          else
             echo "windows_runner=windows-2019" >> $GITHUB_OUTPUT
-            echo "ℹ️ Self-hosted Windows runner offline — falling back to windows-2019"
+            echo "⚠️ Forcing GitHub-hosted runners (manual override)"
+          else
+            # Check if self-hosted macOS 26 runner is online AND idle
+            # "online" alone isn't enough — runner could be stuck on login screen, frozen, etc.
+            RUNNER_INFO=$(gh api repos/${{ github.repository }}/actions/runners \
+              --jq '.runners[] | select(.labels[].name == "macos-26") | {status: .status, busy: .busy}' 2>/dev/null || echo '{"status":"offline","busy":false}')
+            RUNNER_STATUS=$(echo "$RUNNER_INFO" | jq -r '.status // "offline"')
+            RUNNER_BUSY=$(echo "$RUNNER_INFO" | jq -r '.busy // "false"')
+
+            if [ "$RUNNER_STATUS" = "online" ] && [ "$RUNNER_BUSY" = "false" ]; then
+              echo "macos26_runner=macos-26" >> $GITHUB_OUTPUT
+              echo "✅ Self-hosted macOS 26 runner is online and idle"
+            elif [ "$RUNNER_STATUS" = "online" ] && [ "$RUNNER_BUSY" = "true" ]; then
+              echo "macos26_runner=macos-26" >> $GITHUB_OUTPUT
+              echo "⏳ Self-hosted macOS 26 runner is online but busy — job will queue"
+            else
+              echo "macos26_runner=macos-latest" >> $GITHUB_OUTPUT
+              echo "ℹ️ Self-hosted macOS 26 runner offline — falling back to macos-latest"
+            fi
+
+            # Windows: temporarily forcing GH-hosted runner due to symlink permission issues
+            # TODO: re-enable self-hosted once runner has Developer Mode enabled
+            echo "windows_runner=windows-2019" >> $GITHUB_OUTPUT
+            echo "ℹ️ Using GitHub-hosted Windows runner (self-hosted has symlink permission issues)"
           fi
 
   draft:
@@ -122,8 +134,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Self-hosted macOS 26 runner for Apple Silicon (has Xcode 26 for Apple Intelligence)
-          # Dynamically falls back to macos-latest if self-hosted runner is offline
+          # Self-hosted macOS 26 runner (MacBook Pro) for Apple Silicon + Apple Intelligence
+          # Falls back to macos-latest (GH-hosted) if runner is offline
           - platform: ${{ needs.check_commit.outputs.macos26_runner || 'macos-latest' }}
             args: "--target aarch64-apple-darwin --features metal"
             target: aarch64-apple-darwin
@@ -177,9 +189,10 @@ jobs:
         shell: powershell
         run: |
           Write-Host "Enabling git core.longpaths..."
-          git config --system core.longpaths true
+          # Use --global instead of --system to avoid permission issues on self-hosted runners
+          git config --global core.longpaths true
           # Verify the setting
-          $longpaths = git config --system --get core.longpaths
+          $longpaths = git config --global --get core.longpaths
           Write-Host "core.longpaths is set to: $longpaths"
           if ($longpaths -ne "true") {
             throw "Failed to enable git long paths"
@@ -712,6 +725,72 @@ jobs:
           api-key: ${{ secrets.CN_API_KEY }}
           path: ./apps/screenpipe-app-tauri/src-tauri
 
+      - name: Upload to Cloudflare R2 (macOS)
+        if: matrix.os_type == 'macos'
+        continue-on-error: true
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ENDPOINT: https://${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com
+        run: |
+          VERSION=$(grep '^version = ' apps/screenpipe-app-tauri/src-tauri/Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          TARGET="${{ matrix.target }}"
+          BUNDLE_DIR="apps/screenpipe-app-tauri/src-tauri/target/${TARGET}/release/bundle"
+          R2_PREFIX="s3://screenpipe-releases/releases/${VERSION}/${TARGET}"
+
+          echo "uploading ${TARGET} bundles for v${VERSION} to R2..."
+
+          # Upload DMG
+          for f in ${BUNDLE_DIR}/dmg/*.dmg; do
+            [ -f "$f" ] && aws s3 cp "$f" "${R2_PREFIX}/$(basename $f)" --endpoint-url "$R2_ENDPOINT" && echo "  ✅ $(basename $f)"
+          done
+
+          # Upload updater artifacts (.tar.gz + .sig)
+          for f in ${BUNDLE_DIR}/macos/*.tar.gz ${BUNDLE_DIR}/macos/*.sig; do
+            [ -f "$f" ] && aws s3 cp "$f" "${R2_PREFIX}/$(basename $f)" --endpoint-url "$R2_ENDPOINT" && echo "  ✅ $(basename $f)"
+          done
+
+          echo "R2 upload complete for ${TARGET}"
+
+      - name: Upload to Cloudflare R2 (Windows)
+        if: matrix.os_type == 'windows'
+        continue-on-error: true
+        shell: powershell
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+        run: |
+          # Install AWS CLI if not present
+          if (-not (Get-Command aws -ErrorAction SilentlyContinue)) {
+            Write-Host "Installing AWS CLI..."
+            Invoke-WebRequest -Uri "https://awscli.amazonaws.com/AWSCLIV2.msi" -OutFile "$env:TEMP\awscli.msi"
+            Start-Process msiexec.exe -Wait -ArgumentList "/i $env:TEMP\awscli.msi /quiet"
+            $env:PATH += ";C:\Program Files\Amazon\AWSCLIV2"
+          }
+          $version = (Select-String -Path apps/screenpipe-app-tauri/src-tauri/Cargo.toml -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value
+          $bundleDir = "apps/screenpipe-app-tauri/src-tauri/target/x86_64-pc-windows-msvc/release/bundle"
+          $r2Endpoint = "https://${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com"
+          $r2Prefix = "s3://screenpipe-releases/releases/$version/x86_64-pc-windows-msvc"
+
+          Write-Host "uploading Windows bundles for v$version to R2..."
+
+          # Upload NSIS installer (.exe)
+          Get-ChildItem "$bundleDir/nsis/*.exe" -ErrorAction SilentlyContinue | ForEach-Object {
+            aws s3 cp $_.FullName "$r2Prefix/$($_.Name)" --endpoint-url $r2Endpoint
+            Write-Host "  ✅ $($_.Name)"
+          }
+
+          # Upload updater artifacts (.nsis.zip + .sig)
+          Get-ChildItem "$bundleDir/nsis/*.nsis.zip","$bundleDir/nsis/*.sig" -ErrorAction SilentlyContinue | ForEach-Object {
+            aws s3 cp $_.FullName "$r2Prefix/$($_.Name)" --endpoint-url $r2Endpoint
+            Write-Host "  ✅ $($_.Name)"
+          }
+
+          Write-Host "R2 upload complete for Windows"
+
   publish-release:
     needs: [check_commit, publish-tauri]
     # Only auto-publish when commit message contains "release-app-publish"
@@ -741,23 +820,54 @@ jobs:
         with:
           command: release publish ${{ secrets.CN_APP_SLUG_BETA }} ${{ env.VERSION }}
           api-key: ${{ secrets.CN_API_KEY }}
-          
+
+      - name: Write R2 latest.json manifest
+        continue-on-error: true
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ENDPOINT: https://${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com
+        run: |
+          VERSION="${{ env.VERSION }}"
+          PUB_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          # List what was actually uploaded for each platform
+          PLATFORMS=""
+          for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-pc-windows-msvc; do
+            FILES=$(aws s3 ls "s3://screenpipe-releases/releases/${VERSION}/${target}/" --endpoint-url "$R2_ENDPOINT" 2>/dev/null | awk '{print $4}' | tr '\n' ',' | sed 's/,$//')
+            if [ -n "$FILES" ]; then
+              PLATFORMS="${PLATFORMS}\"${target}\": { \"files\": [$(echo $FILES | sed 's/\([^,]*\)/"\1"/g')] },"
+            fi
+          done
+          PLATFORMS=$(echo "$PLATFORMS" | sed 's/,$//')
+
+          cat > /tmp/latest.json << MANIFEST
+          {
+            "version": "${VERSION}",
+            "pub_date": "${PUB_DATE}",
+            "platforms": { ${PLATFORMS} }
+          }
+          MANIFEST
+
+          # Pretty-print and upload
+          python3 -m json.tool /tmp/latest.json > /tmp/latest-pretty.json 2>/dev/null && mv /tmp/latest-pretty.json /tmp/latest.json
+          aws s3 cp /tmp/latest.json "s3://screenpipe-releases/latest.json" --endpoint-url "$R2_ENDPOINT" --content-type "application/json"
+          echo "✅ R2 latest.json updated for v${VERSION}"
+
       - name: Create testing notification
         if: needs.check_commit.outputs.should_test == 'true'
         uses: actions/github-script@v6
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            // Get CrabNebula release URL from environment
-            const releaseUrl = "https://web.crabnebula.cloud/mediar/screenpipe/releases";
-            
             // Create release discussion issue
             const message = `
             ## 🧪 testing needed for v${{ env.VERSION }}
             
             this release needs community testing. a testing bounty issue will be created shortly.
             
-            - download the release: [crabnebula cloud](${ releaseUrl })
+            - download the release: [screenpi.pe](https://screenpi.pe)
             - testing guidelines: [testing.md](https://github.com/screenpipe/screenpipe/blob/main/TESTING.md)
             
             each tester who provides quality feedback will receive a $20 bounty through algora.

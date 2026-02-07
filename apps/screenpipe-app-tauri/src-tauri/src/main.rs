@@ -977,6 +977,7 @@ async fn main() {
                 // Commands from permissions.rs
                 permissions::open_permission_settings,
                 permissions::request_permission,
+                permissions::reset_and_request_permission,
                 permissions::do_permissions_check,
                 permissions::check_microphone_permission,
                 permissions::check_accessibility_permission_cmd,
@@ -1325,6 +1326,9 @@ async fn main() {
 
             // Autostart setup
             let autostart_manager = app.autolaunch();
+
+            // Install Pi coding agent in background (fire-and-forget, never crashes)
+            crate::pi::ensure_pi_installed_background();
 
             info!("Local data directory: {}", base_dir.display());
 
