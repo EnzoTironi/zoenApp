@@ -14,7 +14,7 @@ use oasgen::{oasgen, OaSchema, Server};
 use chrono::TimeZone;
 use screenpipe_db::{
     ContentType, DatabaseManager, FrameData, Order, SearchMatch, SearchResult, Speaker,
-    TagContentType, TextPosition,
+    TagContentType, TenantScopedDb, TextPosition,
 };
 
 use tokio_util::io::ReaderStream;
@@ -30,6 +30,7 @@ use screenpipe_events::{send_event, subscribe_to_all_events, Event as Screenpipe
 
 use crate::{
     analytics,
+    auth::{self, auth_middleware, AuthenticatedUser, Role},
     embedding::embedding_endpoint::create_embeddings,
     video::{finish_ffmpeg_process, start_ffmpeg_process, write_frame_to_ffmpeg, MAX_FPS},
     video_cache::{AudioEntry, DeviceFrame, FrameCache, FrameMetadata, TimeSeriesFrame},
@@ -53,7 +54,9 @@ use tracing::{debug, error, info, warn};
 
 use crate::sync_api::{self, SyncState};
 
-use screenpipe_vision::monitor::{get_monitor_by_id, list_monitors, list_monitors_detailed, MonitorListError};
+use screenpipe_vision::monitor::{
+    get_monitor_by_id, list_monitors, list_monitors_detailed, MonitorListError,
+};
 use screenpipe_vision::OcrEngine;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
@@ -83,7 +86,7 @@ use tokio::{
     time::timeout,
 };
 
-use tower_http::{cors::Any, trace::TraceLayer};
+use tower_http::trace::TraceLayer;
 use tower_http::{cors::CorsLayer, trace::DefaultMakeSpan};
 
 use std::str::FromStr;
@@ -719,15 +722,12 @@ pub async fn api_list_monitors(
     }
 }
 
-pub async fn api_vision_status(
-) -> JsonResponse<serde_json::Value> {
+pub async fn api_vision_status() -> JsonResponse<serde_json::Value> {
     match list_monitors_detailed().await {
-        Ok(monitors) if monitors.is_empty() => {
-            JsonResponse(json!({
-                "status": "no_monitors",
-                "message": "No monitors found"
-            }))
-        }
+        Ok(monitors) if monitors.is_empty() => JsonResponse(json!({
+            "status": "no_monitors",
+            "message": "No monitors found"
+        })),
         Ok(monitors) => {
             let monitor_ids: Vec<u32> = monitors.iter().map(|m| m.id()).collect();
             JsonResponse(json!({
@@ -736,24 +736,18 @@ pub async fn api_vision_status(
                 "monitor_ids": monitor_ids
             }))
         }
-        Err(MonitorListError::PermissionDenied) => {
-            JsonResponse(json!({
-                "status": "permission_denied",
-                "message": "Screen recording permission not granted. Grant access in System Settings > Privacy & Security > Screen Recording"
-            }))
-        }
-        Err(MonitorListError::NoMonitorsFound) => {
-            JsonResponse(json!({
-                "status": "no_monitors",
-                "message": "No monitors found"
-            }))
-        }
-        Err(MonitorListError::Other(e)) => {
-            JsonResponse(json!({
-                "status": "error",
-                "message": e
-            }))
-        }
+        Err(MonitorListError::PermissionDenied) => JsonResponse(json!({
+            "status": "permission_denied",
+            "message": "Screen recording permission not granted. Grant access in System Settings > Privacy & Security > Screen Recording"
+        })),
+        Err(MonitorListError::NoMonitorsFound) => JsonResponse(json!({
+            "status": "no_monitors",
+            "message": "No monitors found"
+        })),
+        Err(MonitorListError::Other(e)) => JsonResponse(json!({
+            "status": "error",
+            "message": e
+        })),
     }
 }
 
@@ -786,6 +780,41 @@ pub(crate) async fn add_tags(
     }
 }
 
+// Tenant-scoped version of add_tags - requires authentication
+pub(crate) async fn add_tags_with_auth(
+    State(state): State<Arc<AppState>>,
+    Path((content_type, id)): Path<(String, i64)>,
+    JsonResponse(payload): JsonResponse<AddTagsRequest>,
+    axum::extract::Extension(user): axum::extract::Extension<crate::auth::AuthenticatedUser>,
+) -> Result<Json<AddTagsResponse>, (StatusCode, JsonResponse<Value>)> {
+    let content_type = match content_type.as_str() {
+        "vision" => TagContentType::Vision,
+        "audio" => TagContentType::Audio,
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                JsonResponse(json!({"error": "Invalid content type"})),
+            ))
+        }
+    };
+
+    let tenant_ctx = user.to_tenant_context();
+    match state
+        .db
+        .add_tags_with_tenant(id, content_type, payload.tags, &tenant_ctx)
+        .await
+    {
+        Ok(_) => Ok(JsonResponse(AddTagsResponse { success: true })),
+        Err(e) => {
+            error!("Failed to add tags: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                JsonResponse(json!({"error": e.to_string()})),
+            ))
+        }
+    }
+}
+
 #[oasgen]
 pub(crate) async fn remove_tags(
     State(state): State<Arc<AppState>>,
@@ -804,6 +833,41 @@ pub(crate) async fn remove_tags(
     };
 
     match state.db.remove_tags(id, content_type, payload.tags).await {
+        Ok(_) => Ok(JsonResponse(RemoveTagsResponse { success: true })),
+        Err(e) => {
+            error!("Failed to remove tag: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                JsonResponse(json!({"error": e.to_string()})),
+            ))
+        }
+    }
+}
+
+// Tenant-scoped version of remove_tags - requires authentication
+pub(crate) async fn remove_tags_with_auth(
+    State(state): State<Arc<AppState>>,
+    Path((content_type, id)): Path<(String, i64)>,
+    JsonResponse(payload): JsonResponse<RemoveTagsRequest>,
+    axum::extract::Extension(user): axum::extract::Extension<crate::auth::AuthenticatedUser>,
+) -> Result<Json<RemoveTagsResponse>, (StatusCode, JsonResponse<Value>)> {
+    let content_type = match content_type.as_str() {
+        "vision" => TagContentType::Vision,
+        "audio" => TagContentType::Audio,
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                JsonResponse(json!({"error": "Invalid content type"})),
+            ))
+        }
+    };
+
+    let tenant_ctx = user.to_tenant_context();
+    match state
+        .db
+        .remove_tags_with_tenant(id, content_type, payload.tags, &tenant_ctx)
+        .await
+    {
         Ok(_) => Ok(JsonResponse(RemoveTagsResponse { success: true })),
         Err(e) => {
             error!("Failed to remove tag: {}", e);
@@ -1320,6 +1384,7 @@ pub struct SCServer {
     use_pii_removal: bool,
     sync_handle: Option<Arc<SyncServiceHandle>>,
     video_quality: String,
+    playbook_manager: Option<Arc<crate::playbook_manager::PlaybookManager>>,
 }
 
 impl SCServer {
@@ -1348,6 +1413,7 @@ impl SCServer {
             use_pii_removal,
             sync_handle: None,
             video_quality,
+            playbook_manager: None,
         }
     }
 
@@ -1360,6 +1426,15 @@ impl SCServer {
     /// Set the sync service handle from an Arc
     pub fn with_sync_handle_arc(mut self, handle: Arc<SyncServiceHandle>) -> Self {
         self.sync_handle = Some(handle);
+        self
+    }
+
+    /// Set the playbook manager
+    pub fn with_playbook_manager(
+        mut self,
+        playbook_manager: crate::playbook_manager::PlaybookManager,
+    ) -> Self {
+        self.playbook_manager = Some(Arc::new(playbook_manager));
         self
     }
 
@@ -1469,14 +1544,8 @@ impl SCServer {
             api_request_count: api_request_count.clone(),
         });
 
-        let cors = CorsLayer::new()
-            .allow_origin(Any)
-            .allow_methods(Any)
-            .allow_headers(Any)
-            .expose_headers([
-                axum::http::header::CONTENT_TYPE,
-                axum::http::header::CACHE_CONTROL,
-            ]);
+        // Use restricted CORS layer from auth module
+        let cors = auth::create_cors_layer();
         let server = Server::axum()
             .get("/search", search)
             .get("/audio/list", api_list_audio_devices)
@@ -1548,22 +1617,40 @@ impl SCServer {
                 axum::routing::post(crate::apple_intelligence_api::chat_completions),
             );
 
+        // Apply auth middleware if authentication is configured
+        // Auth is optional - if no JWT_SECRET or API keys are set, all endpoints remain open
+        let auth_layer = if auth::is_auth_enabled() {
+            info!("Authentication enabled - applying auth middleware to all routes");
+            Some(axum::middleware::from_fn(auth::auth_middleware_with_state))
+        } else {
+            debug!("Authentication not configured - endpoints remain open");
+            None
+        };
+
         // NOTE: websockets and sse is not supported by openapi so we move it down here
-        router
+        let router = router
             .route("/stream/frames", get(stream_frames_handler))
             .route("/ws/events", get(ws_events_handler))
             .route("/ws/health", get(ws_health_handler))
             .route("/frames/export", get(handle_video_export_ws))
             .with_state(app_state.clone())
-            .layer(axum::middleware::from_fn(move |req: axum::extract::Request, next: axum::middleware::Next| {
-                let counter = app_state.api_request_count.clone();
-                async move {
-                    counter.fetch_add(1, Ordering::Relaxed);
-                    next.run(req).await
-                }
-            }))
+            .layer(axum::middleware::from_fn(
+                move |req: axum::extract::Request, next: axum::middleware::Next| {
+                    let counter = app_state.api_request_count.clone();
+                    async move {
+                        counter.fetch_add(1, Ordering::Relaxed);
+                        next.run(req).await
+                    }
+                },
+            ))
             .layer(cors)
-            .layer(TraceLayer::new_for_http().make_span_with(DefaultMakeSpan::default()))
+            .layer(TraceLayer::new_for_http().make_span_with(DefaultMakeSpan::default()));
+
+        // Apply auth layer if configured (layers are applied in reverse order, so auth goes last)
+        match auth_layer {
+            Some(layer) => router.layer(layer),
+            None => router,
+        }
     }
 }
 
@@ -3300,11 +3387,16 @@ pub async fn get_frame_data(
                     }
                     Err(e) => {
                         let err_str = e.to_string();
-                        
+
                         // Check for corrupted/missing video errors - return 410 Gone
                         // This tells frontend the frame is permanently unavailable
-                        if err_str.contains("VIDEO_CORRUPTED") || err_str.contains("VIDEO_NOT_FOUND") {
-                            debug!("Frame {} unavailable (corrupted/missing video): {}", frame_id, e);
+                        if err_str.contains("VIDEO_CORRUPTED")
+                            || err_str.contains("VIDEO_NOT_FOUND")
+                        {
+                            debug!(
+                                "Frame {} unavailable (corrupted/missing video): {}",
+                                frame_id, e
+                            );
                             return Err((
                                 StatusCode::GONE, // 410 = permanently unavailable
                                 JsonResponse(json!({
@@ -3316,7 +3408,7 @@ pub async fn get_frame_data(
                                 })),
                             ));
                         }
-                        
+
                         error!("Failed to extract frame {}: {}", frame_id, e);
                         Err((
                             StatusCode::INTERNAL_SERVER_ERROR,

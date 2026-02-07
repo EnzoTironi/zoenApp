@@ -56,7 +56,18 @@ sentry = { workspace = true }
 axum = { version = "0.7.5", features = ["ws"] }
 tokio = { version = "1.15", features = ["full", "tracing"] }
 tokio-stream = "0.1"
-tower-http = { version = "0.5.2", features = ["cors", "trace"] }
+tower-http = { version = "0.5.2", features = ["cors", "trace", "set-header"] }
+tower = { version = "0.5", features = ["util"] }
+
+# Authentication
+jsonwebtoken = "9"
+tower_governor = "0.4"
+governor = "0.6"
+argon2 = "0.5"
+bcrypt = "0.16"
+rand = "0.8"
+hex = "0.4"
+constant_time_eq = "0.3"
 
 # Log
 tracing = { workspace = true }
@@ -76,7 +87,6 @@ colored = "2.0"
 clap_complete = "4.2"
 
 # Plugins
-tower = { version = "0.5", features = ["util"] }
 futures = { version = "0.3.31", features = ["std"] }
 
 # Directory management
@@ -130,6 +140,7 @@ dashmap = { workspace = true }
 env_logger = "0.10"
 tempfile = "3.3.0"
 tokio-tungstenite = "0.24"
+urlencoding = "2.1"
 
 # Benches
 criterion = { workspace = true }

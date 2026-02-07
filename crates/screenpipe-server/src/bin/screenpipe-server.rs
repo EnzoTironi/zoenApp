@@ -33,7 +33,7 @@ use screenpipe_server::{
     vision_manager::{
         start_monitor_watcher, stop_monitor_watcher, VisionManager, VisionManagerConfig,
     },
-    watch_pid, PipeManager, ResourceMonitor, SCServer,
+    watch_pid, PipeManager, PlaybookManager, ResourceMonitor, SCServer,
 };
 use screenpipe_vision::monitor::list_monitors;
 use serde::Deserialize;
@@ -294,41 +294,81 @@ async fn main() -> anyhow::Result<()> {
                 id: Some(analytics::get_distinct_id().to_string()),
                 ..Default::default()
             }));
-            scope.set_context("cli_settings", sentry::protocol::Context::Other({
-                let mut map = std::collections::BTreeMap::new();
-                map.insert("fps".into(), json!(cli.fps));
-                map.insert("adaptive_fps".into(), json!(cli.adaptive_fps));
-                map.insert("audio_chunk_duration".into(), json!(cli.audio_chunk_duration));
-                map.insert("port".into(), json!(cli.port));
-                map.insert("disable_audio".into(), json!(cli.disable_audio));
-                map.insert("audio_transcription_engine".into(), json!(format!("{:?}", cli.audio_transcription_engine)));
-                map.insert("enable_realtime_audio_transcription".into(), json!(cli.enable_realtime_audio_transcription));
-                map.insert("enable_realtime_vision".into(), json!(cli.enable_realtime_vision));
-                map.insert("ocr_engine".into(), json!(format!("{:?}", cli.ocr_engine)));
-                map.insert("monitor_ids".into(), json!(cli.monitor_id));
-                map.insert("use_all_monitors".into(), json!(cli.use_all_monitors));
-                map.insert("languages".into(), json!(cli.language.iter().map(|l| format!("{:?}", l)).collect::<Vec<_>>()));
-                map.insert("use_pii_removal".into(), json!(cli.use_pii_removal));
-                map.insert("disable_vision".into(), json!(cli.disable_vision));
-                map.insert("vad_engine".into(), json!(format!("{:?}", cli.vad_engine)));
-                map.insert("vad_sensitivity".into(), json!(format!("{:?}", cli.vad_sensitivity)));
-                map.insert("video_chunk_duration".into(), json!(cli.video_chunk_duration));
-                map.insert("enable_llm".into(), json!(cli.enable_llm));
-                map.insert("enable_frame_cache".into(), json!(cli.enable_frame_cache));
-                map.insert("capture_unfocused_windows".into(), json!(cli.capture_unfocused_windows));
-                map.insert("enable_pipe_manager".into(), json!(cli.enable_pipe_manager));
-                map.insert("enable_ui_events".into(), json!(cli.enable_ui_events));
-                map.insert("enable_sync".into(), json!(cli.enable_sync));
-                map.insert("sync_interval_secs".into(), json!(cli.sync_interval_secs));
-                map.insert("debug".into(), json!(cli.debug));
-                // Only send counts for privacy-sensitive lists (not actual values)
-                map.insert("audio_device_count".into(), json!(cli.audio_device.len()));
-                map.insert("realtime_audio_device_count".into(), json!(cli.realtime_audio_device.len()));
-                map.insert("ignored_windows_count".into(), json!(cli.ignored_windows.len()));
-                map.insert("included_windows_count".into(), json!(cli.included_windows.len()));
-                map.insert("ignored_urls_count".into(), json!(cli.ignored_urls.len()));
-                map
-            }));
+            scope.set_context(
+                "cli_settings",
+                sentry::protocol::Context::Other({
+                    let mut map = std::collections::BTreeMap::new();
+                    map.insert("fps".into(), json!(cli.fps));
+                    map.insert("adaptive_fps".into(), json!(cli.adaptive_fps));
+                    map.insert(
+                        "audio_chunk_duration".into(),
+                        json!(cli.audio_chunk_duration),
+                    );
+                    map.insert("port".into(), json!(cli.port));
+                    map.insert("disable_audio".into(), json!(cli.disable_audio));
+                    map.insert(
+                        "audio_transcription_engine".into(),
+                        json!(format!("{:?}", cli.audio_transcription_engine)),
+                    );
+                    map.insert(
+                        "enable_realtime_audio_transcription".into(),
+                        json!(cli.enable_realtime_audio_transcription),
+                    );
+                    map.insert(
+                        "enable_realtime_vision".into(),
+                        json!(cli.enable_realtime_vision),
+                    );
+                    map.insert("ocr_engine".into(), json!(format!("{:?}", cli.ocr_engine)));
+                    map.insert("monitor_ids".into(), json!(cli.monitor_id));
+                    map.insert("use_all_monitors".into(), json!(cli.use_all_monitors));
+                    map.insert(
+                        "languages".into(),
+                        json!(cli
+                            .language
+                            .iter()
+                            .map(|l| format!("{:?}", l))
+                            .collect::<Vec<_>>()),
+                    );
+                    map.insert("use_pii_removal".into(), json!(cli.use_pii_removal));
+                    map.insert("disable_vision".into(), json!(cli.disable_vision));
+                    map.insert("vad_engine".into(), json!(format!("{:?}", cli.vad_engine)));
+                    map.insert(
+                        "vad_sensitivity".into(),
+                        json!(format!("{:?}", cli.vad_sensitivity)),
+                    );
+                    map.insert(
+                        "video_chunk_duration".into(),
+                        json!(cli.video_chunk_duration),
+                    );
+                    map.insert("enable_llm".into(), json!(cli.enable_llm));
+                    map.insert("enable_frame_cache".into(), json!(cli.enable_frame_cache));
+                    map.insert(
+                        "capture_unfocused_windows".into(),
+                        json!(cli.capture_unfocused_windows),
+                    );
+                    map.insert("enable_pipe_manager".into(), json!(cli.enable_pipe_manager));
+                    map.insert("enable_ui_events".into(), json!(cli.enable_ui_events));
+                    map.insert("enable_sync".into(), json!(cli.enable_sync));
+                    map.insert("sync_interval_secs".into(), json!(cli.sync_interval_secs));
+                    map.insert("debug".into(), json!(cli.debug));
+                    // Only send counts for privacy-sensitive lists (not actual values)
+                    map.insert("audio_device_count".into(), json!(cli.audio_device.len()));
+                    map.insert(
+                        "realtime_audio_device_count".into(),
+                        json!(cli.realtime_audio_device.len()),
+                    );
+                    map.insert(
+                        "ignored_windows_count".into(),
+                        json!(cli.ignored_windows.len()),
+                    );
+                    map.insert(
+                        "included_windows_count".into(),
+                        json!(cli.included_windows.len()),
+                    );
+                    map.insert("ignored_urls_count".into(), json!(cli.ignored_urls.len()));
+                    map
+                }),
+            );
         });
 
         Some(guard)
@@ -1034,6 +1074,22 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(feature = "llm")]
     debug!("LLM initialized");
 
+    // Initialize playbook manager
+    let playbook_manager = PlaybookManager::new(
+        local_data_dir_clone_2.clone(),
+        Some(Arc::new(db_server.pool.clone())),
+    )
+    .await
+    .expect("Failed to initialize playbook manager");
+
+    // Start playbook manager
+    playbook_manager
+        .start()
+        .await
+        .expect("Failed to start playbook manager");
+
+    info!("Playbook manager initialized and started");
+
     let server = SCServer::new(
         db_server,
         SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), cli.port),
@@ -1045,7 +1101,8 @@ async fn main() -> anyhow::Result<()> {
         cli.enable_pipe_manager,
         cli.use_pii_removal,
         video_quality_for_server,
-    );
+    )
+    .with_playbook_manager(playbook_manager);
 
     // Attach sync handle if sync is enabled
     let server = if let Some(ref handle) = sync_service_handle {
