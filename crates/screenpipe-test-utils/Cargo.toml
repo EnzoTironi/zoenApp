@@ -1,0 +1,28 @@
+[package]
+name = "screenpipe-test-utils"
+version = { workspace = true }
+authors = { workspace = true }
+description = "Test utilities and mocks for screenpipe"
+repository = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
+
+[dependencies]
+anyhow = "1.0.86"
+async-trait = "0.1"
+tokio = { workspace = true }
+tokio-stream = "0.1"
+tracing = { workspace = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4.31", features = ["serde"] }
+image = { workspace = true }
+rand = "0.8"
+screenpipe-core = { path = "../screenpipe-core", default-features = false }
+screenpipe-audio = { path = "../screenpipe-audio" }
+screenpipe-vision = { path = "../screenpipe-vision" }
+screenpipe-db = { path = "../screenpipe-db" }
+
+[dev-dependencies]
+tempfile = "3.3.0"
+tokio-test = "0.4"
