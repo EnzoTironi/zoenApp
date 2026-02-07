@@ -584,3 +584,120 @@ pub struct InsertUiEvent {
     pub element_bounds: Option<String>,
     pub frame_id: Option<i64>,
 }
+
+// ============================================================================
+// Action Items Types
+// ============================================================================
+
+/// Source of the action item
+#[derive(OaSchema, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionItemSource {
+    Meeting,
+    Email,
+    Chat,
+    Document,
+    Other(String),
+}
+
+impl Default for ActionItemSource {
+    fn default() -> Self {
+        ActionItemSource::Meeting
+    }
+}
+
+impl std::fmt::Display for ActionItemSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ActionItemSource::Meeting => write!(f, "meeting"),
+            ActionItemSource::Email => write!(f, "email"),
+            ActionItemSource::Chat => write!(f, "chat"),
+            ActionItemSource::Document => write!(f, "document"),
+            ActionItemSource::Other(s) => write!(f, "{}", s),
+        }
+    }
+}
+
+/// Status of an action item
+#[derive(OaSchema, Debug, Clone, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
+#[serde(rename_all = "snake_case")]
+#[sqlx(rename_all = "snake_case")]
+pub enum ActionItemStatus {
+    Pending,
+    InProgress,
+    Done,
+    Cancelled,
+}
+
+impl Default for ActionItemStatus {
+    fn default() -> Self {
+        ActionItemStatus::Pending
+    }
+}
+
+/// Priority level for action items
+#[derive(
+    OaSchema, Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, sqlx::Type,
+)]
+#[serde(rename_all = "snake_case")]
+#[sqlx(rename_all = "snake_case")]
+pub enum ActionItemPriority {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+impl Default for ActionItemPriority {
+    fn default() -> Self {
+        ActionItemPriority::Medium
+    }
+}
+
+/// Action item stored in the database
+#[derive(OaSchema, Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct ActionItem {
+    pub id: String,
+    pub text: String,
+    pub assignee: Option<String>,
+    pub deadline: Option<DateTime<Utc>>,
+    pub source: String,
+    pub source_id: Option<String>,
+    pub confidence: f64,
+    pub status: ActionItemStatus,
+    pub priority: ActionItemPriority,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<String>, // JSON string
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
+}
+
+/// Parameters for inserting an action item
+#[derive(Debug, Clone)]
+pub struct InsertActionItem {
+    pub id: String,
+    pub text: String,
+    pub assignee: Option<String>,
+    pub deadline: Option<DateTime<Utc>>,
+    pub source: String,
+    pub source_id: Option<String>,
+    pub confidence: f64,
+    pub status: ActionItemStatus,
+    pub priority: ActionItemPriority,
+    pub metadata: Option<String>,
+}
+
+/// Query parameters for searching action items
+#[derive(OaSchema, Debug, Clone, Default)]
+pub struct ActionItemQuery {
+    pub status: Option<ActionItemStatus>,
+    pub source: Option<String>,
+    pub assignee: Option<String>,
+    pub from_date: Option<DateTime<Utc>>,
+    pub to_date: Option<DateTime<Utc>>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}

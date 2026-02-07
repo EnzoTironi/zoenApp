@@ -22,11 +22,12 @@ use zerocopy::AsBytes;
 use futures::future::try_join_all;
 
 use crate::{
-    text_similarity::is_similar_transcription, AudioChunksResponse, AudioDevice, AudioEntry,
-    AudioResult, AudioResultRaw, ContentType, DeviceType, FrameData, FrameRow, FrameWindowData,
-    InsertUiEvent, OCREntry, OCRResult, OCRResultRaw, OcrEngine, OcrTextBlock, Order, SearchMatch,
-    SearchResult, Speaker, TagContentType, TextBounds, TextPosition, TimeSeriesChunk, UiContent,
-    UiEventRecord, UiEventRow, VideoMetadata,
+    text_similarity::is_similar_transcription, ActionItem, ActionItemPriority, ActionItemQuery,
+    ActionItemStatus, AudioChunksResponse, AudioDevice, AudioEntry, AudioResult, AudioResultRaw,
+    ContentType, DeviceType, FrameData, FrameRow, FrameWindowData, InsertActionItem, InsertUiEvent,
+    OCREntry, OCRResult, OCRResultRaw, OcrEngine, OcrTextBlock, Order, SearchMatch, SearchResult,
+    Speaker, TagContentType, TextBounds, TextPosition, TimeSeriesChunk, UiContent, UiEventRecord,
+    UiEventRow, VideoMetadata,
 };
 
 /// Time window (in seconds) to check for similar transcriptions across devices.
@@ -122,7 +123,7 @@ impl DatabaseManager {
             // connections wait before returning SQLITE_BUSY ("database is locked").
             .busy_timeout(Duration::from_secs(10))
             .pragma("journal_mode", "WAL")
-            .pragma("cache_size", "-64000")   // 64 MB page cache
+            .pragma("cache_size", "-64000") // 64 MB page cache
             .pragma("mmap_size", "268435456") // 256 MB memory-mapped I/O
             .pragma("temp_store", "MEMORY")
             // Checkpoint after 4000 pages (~16MB) instead of default 1000 (~4MB).
@@ -150,27 +151,51 @@ impl DatabaseManager {
     async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         let mut migrator = sqlx::migrate!("./src/migrations");
         migrator.set_ignore_missing(true);
-        match migrator.run(pool).await {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                let err_str = e.to_string();
-                // Handle checksum mismatch from modified migrations.
-                // This can happen when a migration file was changed after being applied
-                // (e.g., the fps migration was modified between v0.3.130 and v0.3.131).
-                // Fix: update the stored checksum to match the current file, then retry.
-                if err_str.contains("was previously applied but has been modified") {
-                    tracing::warn!(
-                        "Migration checksum mismatch detected: {}. Updating checksums and retrying...",
-                        err_str
-                    );
-                    Self::fix_migration_checksums(pool, &migrator).await?;
-                    // Retry after fixing checksums
-                    migrator.run(pool).await.map_err(|e| e.into())
-                } else {
-                    Err(e.into())
+
+        // Retry migration up to 3 times with exponential backoff
+        // This handles concurrent test execution where multiple databases
+        // are being created simultaneously
+        let mut last_error = None;
+        for attempt in 0..3 {
+            match migrator.run(pool).await {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    let err_str = e.to_string();
+
+                    // Handle checksum mismatch from modified migrations
+                    if err_str.contains("was previously applied but has been modified") {
+                        tracing::warn!(
+                            "Migration checksum mismatch detected: {}. Updating checksums and retrying...",
+                            err_str
+                        );
+                        Self::fix_migration_checksums(pool, &migrator).await?;
+                        // Retry after fixing checksums
+                        match migrator.run(pool).await {
+                            Ok(_) => return Ok(()),
+                            Err(e) => return Err(e.into()),
+                        }
+                    }
+
+                    // Handle concurrent migration execution
+                    if err_str.contains("UNIQUE constraint failed: _sqlx_migrations.version") {
+                        tracing::warn!(
+                            "Migration version conflict on attempt {}: {}. Retrying...",
+                            attempt + 1,
+                            err_str
+                        );
+                        last_error = Some(e);
+                        // Wait before retrying
+                        tokio::time::sleep(tokio::time::Duration::from_millis(100 * (attempt + 1) as u64)).await;
+                        continue;
+                    }
+
+                    return Err(e.into());
                 }
             }
         }
+
+        // If we get here, all retries failed
+        Err(last_error.unwrap().into())
     }
 
     /// Fix checksum mismatches by updating stored checksums to match current migration files.
@@ -187,13 +212,11 @@ impl DatabaseManager {
             // Update the checksum for any previously-applied migration to match the current file
             let version = migration.version;
             let checksum_bytes: &[u8] = &migration.checksum;
-            sqlx::query(
-                "UPDATE _sqlx_migrations SET checksum = ? WHERE version = ?"
-            )
-            .bind(checksum_bytes)
-            .bind(version)
-            .execute(pool)
-            .await?;
+            sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = ?")
+                .bind(checksum_bytes)
+                .bind(version)
+                .execute(pool)
+                .await?;
         }
         tracing::info!("Migration checksums updated successfully");
         Ok(())
@@ -206,14 +229,17 @@ impl DatabaseManager {
     /// when a deferred reader tries to upgrade to writer after another commit.
     ///
     /// Returns an `ImmediateTx` that automatically rolls back on drop if not committed.
-    pub async fn begin_immediate_with_retry(
-        &self,
-    ) -> Result<ImmediateTx, sqlx::Error> {
+    pub async fn begin_immediate_with_retry(&self) -> Result<ImmediateTx, sqlx::Error> {
         let max_retries = 5;
         for attempt in 1..=max_retries {
             let mut conn = self.pool.acquire().await?;
             match sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await {
-                Ok(_) => return Ok(ImmediateTx { conn: Some(conn), committed: false }),
+                Ok(_) => {
+                    return Ok(ImmediateTx {
+                        conn: Some(conn),
+                        committed: false,
+                    })
+                }
                 Err(e) if attempt < max_retries && Self::is_busy_error(&e) => {
                     warn!(
                         "BEGIN IMMEDIATE busy (attempt {}/{}), retrying...",
@@ -491,7 +517,8 @@ impl DatabaseManager {
         file_path: &str,
         device_name: &str,
     ) -> Result<i64, sqlx::Error> {
-        self.insert_video_chunk_with_fps(file_path, device_name, 0.5).await
+        self.insert_video_chunk_with_fps(file_path, device_name, 0.5)
+            .await
     }
 
     pub async fn insert_video_chunk_with_fps(
@@ -501,13 +528,15 @@ impl DatabaseManager {
         fps: f64,
     ) -> Result<i64, sqlx::Error> {
         let mut tx = self.begin_immediate_with_retry().await?;
-        let id = sqlx::query("INSERT INTO video_chunks (file_path, device_name, fps) VALUES (?1, ?2, ?3)")
-            .bind(file_path)
-            .bind(device_name)
-            .bind(fps)
-            .execute(&mut **tx.conn())
-            .await?
-            .last_insert_rowid();
+        let id = sqlx::query(
+            "INSERT INTO video_chunks (file_path, device_name, fps) VALUES (?1, ?2, ?3)",
+        )
+        .bind(file_path)
+        .bind(device_name)
+        .bind(fps)
+        .execute(&mut **tx.conn())
+        .await?
+        .last_insert_rowid();
         tx.commit().await?;
         Ok(id)
     }
@@ -2312,28 +2341,35 @@ impl DatabaseManager {
         offset: u32,
     ) -> Result<Vec<UiEventRecord>, sqlx::Error> {
         let mut conditions = vec!["1=1".to_string()];
+        let mut bind_params: Vec<String> = Vec::new();
 
         if let Some(q) = query {
             if !q.is_empty() {
-                conditions.push(format!(
-                    "(text_content LIKE '%{}%' OR app_name LIKE '%{}%' OR window_title LIKE '%{}%')",
-                    q, q, q
-                ));
+                conditions.push(
+                    "(text_content LIKE ? OR app_name LIKE ? OR window_title LIKE ?)".to_string(),
+                );
+                let pattern = format!("%{}%", q);
+                bind_params.push(pattern.clone());
+                bind_params.push(pattern.clone());
+                bind_params.push(pattern);
             }
         }
         if let Some(et) = event_type {
             if !et.is_empty() {
-                conditions.push(format!("event_type = '{}'", et));
+                conditions.push("event_type = ?".to_string());
+                bind_params.push(et.to_string());
             }
         }
         if let Some(app) = app_name {
             if !app.is_empty() {
-                conditions.push(format!("app_name LIKE '%{}%'", app));
+                conditions.push("app_name LIKE ?".to_string());
+                bind_params.push(format!("%{}%", app));
             }
         }
         if let Some(window) = window_name {
             if !window.is_empty() {
-                conditions.push(format!("window_title LIKE '%{}%'", window));
+                conditions.push("window_title LIKE ?".to_string());
+                bind_params.push(format!("%{}%", window));
             }
         }
 
@@ -2359,13 +2395,17 @@ impl DatabaseManager {
             where_clause
         );
 
-        let rows: Vec<UiEventRow> = sqlx::query_as(&sql)
+        let mut query_builder = sqlx::query_as(&sql)
             .bind(start_time)
             .bind(end_time)
             .bind(limit)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await?;
+            .bind(offset);
+
+        for param in bind_params {
+            query_builder = query_builder.bind(param);
+        }
+
+        let rows: Vec<UiEventRow> = query_builder.fetch_all(&self.pool).await?;
 
         Ok(rows.into_iter().map(|r| r.into()).collect())
     }
@@ -3361,13 +3401,11 @@ LIMIT ? OFFSET ?
                 let mut tx = self.begin_immediate_with_retry().await?;
 
                 for (emb_id, old_speaker_id) in &similar_rows {
-                    sqlx::query(
-                        "UPDATE speaker_embeddings SET speaker_id = ? WHERE id = ?",
-                    )
-                    .bind(target_speaker_id)
-                    .bind(emb_id)
-                    .execute(&mut **tx.conn())
-                    .await?;
+                    sqlx::query("UPDATE speaker_embeddings SET speaker_id = ? WHERE id = ?")
+                        .bind(target_speaker_id)
+                        .bind(emb_id)
+                        .execute(&mut **tx.conn())
+                        .await?;
                     embeddings_moved += 1;
 
                     sqlx::query(
@@ -3888,5 +3926,396 @@ mod tests {
 
         // Should match both "Hello" and "World" due to word-by-word matching
         assert_eq!(positions.len(), 2);
+    }
+
+    // ============================================================================
+    // Action Items Methods
+    // ============================================================================
+}
+
+impl DatabaseManager {
+    pub async fn insert_action_item(
+        &self,
+        item: &InsertActionItem,
+        tenant_id: &str,
+    ) -> Result<ActionItem, sqlx::Error> {
+        let row: ActionItem = sqlx::query_as(
+            r#"
+            INSERT INTO action_items (
+                id, text, assignee, deadline, source, source_id,
+                confidence, status, priority, metadata, tenant_id
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            RETURNING *
+            "#,
+        )
+        .bind(&item.id)
+        .bind(&item.text)
+        .bind(&item.assignee)
+        .bind(item.deadline)
+        .bind(&item.source)
+        .bind(&item.source_id)
+        .bind(item.confidence)
+        .bind(item.status.clone())
+        .bind(item.priority.clone())
+        .bind(&item.metadata)
+        .bind(tenant_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(row)
+    }
+
+    pub async fn insert_action_items_batch(
+        &self,
+        items: &[InsertActionItem],
+        tenant_id: &str,
+    ) -> Result<Vec<ActionItem>, sqlx::Error> {
+        let mut tx = self.begin_immediate_with_retry().await?;
+        let mut results = Vec::with_capacity(items.len());
+
+        for item in items {
+            let row: ActionItem = sqlx::query_as(
+                r#"
+                INSERT INTO action_items (
+                    id, text, assignee, deadline, source, source_id,
+                    confidence, status, priority, metadata, tenant_id
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                RETURNING *
+                "#,
+            )
+            .bind(&item.id)
+            .bind(&item.text)
+            .bind(&item.assignee)
+            .bind(item.deadline)
+            .bind(&item.source)
+            .bind(&item.source_id)
+            .bind(item.confidence)
+            .bind(item.status.clone())
+            .bind(item.priority.clone())
+            .bind(&item.metadata)
+            .bind(tenant_id)
+            .fetch_one(&mut **tx.conn())
+            .await?;
+
+            results.push(row);
+        }
+
+        tx.commit().await?;
+        Ok(results)
+    }
+
+    pub async fn get_action_item(&self, id: &str) -> Result<Option<ActionItem>, sqlx::Error> {
+        let row: Option<ActionItem> = sqlx::query_as("SELECT * FROM action_items WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        Ok(row)
+    }
+
+    pub async fn get_action_item_with_tenant(
+        &self,
+        id: &str,
+        tenant_id: &str,
+    ) -> Result<Option<ActionItem>, sqlx::Error> {
+        let row: Option<ActionItem> = sqlx::query_as(
+            "SELECT * FROM action_items WHERE id = ? AND (tenant_id = ? OR tenant_id IS NULL)",
+        )
+        .bind(id)
+        .bind(tenant_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row)
+    }
+
+    pub async fn get_action_items_by_source(
+        &self,
+        source: &str,
+        source_id: Option<&str>,
+    ) -> Result<Vec<ActionItem>, sqlx::Error> {
+        let query = if let Some(sid) = source_id {
+            sqlx::query_as::<_, ActionItem>(
+                "SELECT * FROM action_items WHERE source = ? AND source_id = ? ORDER BY created_at DESC"
+            )
+            .bind(source)
+            .bind(sid)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, ActionItem>(
+                "SELECT * FROM action_items WHERE source = ? ORDER BY created_at DESC",
+            )
+            .bind(source)
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        Ok(query)
+    }
+
+    pub async fn get_action_items_by_source_with_tenant(
+        &self,
+        source: &str,
+        source_id: Option<&str>,
+        tenant_id: &str,
+    ) -> Result<Vec<ActionItem>, sqlx::Error> {
+        let query = if let Some(sid) = source_id {
+            sqlx::query_as::<_, ActionItem>(
+                "SELECT * FROM action_items WHERE source = ? AND source_id = ? AND (tenant_id = ? OR tenant_id IS NULL) ORDER BY created_at DESC"
+            )
+            .bind(source)
+            .bind(sid)
+            .bind(tenant_id)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, ActionItem>(
+                "SELECT * FROM action_items WHERE source = ? AND (tenant_id = ? OR tenant_id IS NULL) ORDER BY created_at DESC"
+            )
+            .bind(source)
+            .bind(tenant_id)
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        Ok(query)
+    }
+
+    pub async fn query_action_items(
+        &self,
+        query: &ActionItemQuery,
+        tenant_id: &str,
+    ) -> Result<Vec<ActionItem>, sqlx::Error> {
+        let mut conditions = Vec::new();
+        let mut bind_params: Vec<String> = Vec::new();
+        let mut sql =
+            "SELECT * FROM action_items WHERE (tenant_id = ? OR tenant_id IS NULL)".to_string();
+        bind_params.push(tenant_id.to_string());
+
+        if let Some(status) = &query.status {
+            conditions.push("status = ?".to_string());
+            bind_params.push(format!("{:?}", status).to_lowercase());
+        }
+
+        if let Some(source) = &query.source {
+            conditions.push("source = ?".to_string());
+            bind_params.push(source.clone());
+        }
+
+        if let Some(assignee) = &query.assignee {
+            conditions.push("assignee = ?".to_string());
+            bind_params.push(assignee.clone());
+        }
+
+        if let Some(from_date) = query.from_date {
+            conditions.push("created_at >= ?".to_string());
+            bind_params.push(from_date.to_rfc3339());
+        }
+
+        if let Some(to_date) = query.to_date {
+            conditions.push("created_at <= ?".to_string());
+            bind_params.push(to_date.to_rfc3339());
+        }
+
+        if !conditions.is_empty() {
+            sql.push_str(" AND ");
+            sql.push_str(&conditions.join(" AND "));
+        }
+
+        sql.push_str(" ORDER BY created_at DESC");
+
+        if let Some(limit) = query.limit {
+            sql.push_str(" LIMIT ?");
+            bind_params.push(limit.to_string());
+        }
+
+        if let Some(offset) = query.offset {
+            sql.push_str(" OFFSET ?");
+            bind_params.push(offset.to_string());
+        }
+
+        let mut query_builder = sqlx::query_as(&sql);
+        for param in bind_params {
+            query_builder = query_builder.bind(param);
+        }
+
+        let rows: Vec<ActionItem> = query_builder.fetch_all(&self.pool).await?;
+        Ok(rows)
+    }
+
+    pub async fn update_action_item_status(
+        &self,
+        id: &str,
+        status: ActionItemStatus,
+        tenant_id: &str,
+    ) -> Result<Option<ActionItem>, sqlx::Error> {
+        let completed_at = if status == ActionItemStatus::Done {
+            Some(Utc::now())
+        } else {
+            None
+        };
+
+        let row: Option<ActionItem> = sqlx::query_as(
+            r#"
+            UPDATE action_items
+            SET status = ?1, completed_at = ?2, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?3 AND (tenant_id = ?4 OR tenant_id IS NULL)
+            RETURNING *
+            "#,
+        )
+        .bind(status)
+        .bind(completed_at)
+        .bind(id)
+        .bind(tenant_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row)
+    }
+
+    pub async fn update_action_item(
+        &self,
+        id: &str,
+        text: Option<&str>,
+        assignee: Option<&str>,
+        deadline: Option<DateTime<Utc>>,
+        priority: Option<ActionItemPriority>,
+        tenant_id: &str,
+    ) -> Result<Option<ActionItem>, sqlx::Error> {
+        let mut sets = Vec::new();
+
+        if text.is_some() {
+            sets.push("text = ?".to_string());
+        }
+        if assignee.is_some() {
+            sets.push("assignee = ?".to_string());
+        }
+        if deadline.is_some() {
+            sets.push("deadline = ?".to_string());
+        }
+        if priority.is_some() {
+            sets.push("priority = ?".to_string());
+        }
+
+        if sets.is_empty() {
+            return self.get_action_item_with_tenant(id, tenant_id).await;
+        }
+
+        sets.push("updated_at = CURRENT_TIMESTAMP".to_string());
+
+        let sql = format!("UPDATE action_items SET {} WHERE id = ? AND (tenant_id = ? OR tenant_id IS NULL) RETURNING *", sets.join(", "));
+        let mut query = sqlx::query_as(&sql);
+
+        if let Some(t) = text {
+            query = query.bind(t);
+        }
+        if let Some(a) = assignee {
+            query = query.bind(a);
+        }
+        if let Some(d) = deadline {
+            query = query.bind(d);
+        }
+        if let Some(p) = priority {
+            query = query.bind(p);
+        }
+
+        let row: Option<ActionItem> = query
+            .bind(id)
+            .bind(tenant_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row)
+    }
+
+    pub async fn delete_action_item(&self, id: &str, tenant_id: &str) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "DELETE FROM action_items WHERE id = ? AND (tenant_id = ? OR tenant_id IS NULL)",
+        )
+        .bind(id)
+        .bind(tenant_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn get_pending_action_items(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<ActionItem>, sqlx::Error> {
+        let rows: Vec<ActionItem> = sqlx::query_as(
+            r#"
+            SELECT * FROM action_items
+            WHERE status = 'pending'
+            ORDER BY
+                CASE priority
+                    WHEN 'critical' THEN 1
+                    WHEN 'high' THEN 2
+                    WHEN 'medium' THEN 3
+                    WHEN 'low' THEN 4
+                END,
+                created_at DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
+    }
+
+    pub async fn get_pending_action_items_with_tenant(
+        &self,
+        limit: i64,
+        tenant_id: &str,
+    ) -> Result<Vec<ActionItem>, sqlx::Error> {
+        let rows: Vec<ActionItem> = sqlx::query_as(
+            r#"
+            SELECT * FROM action_items
+            WHERE status = 'pending' AND (tenant_id = ? OR tenant_id IS NULL)
+            ORDER BY
+                CASE priority
+                    WHEN 'critical' THEN 1
+                    WHEN 'high' THEN 2
+                    WHEN 'medium' THEN 3
+                    WHEN 'low' THEN 4
+                END,
+                created_at DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
+    }
+
+    pub async fn get_action_items_count_by_status(
+        &self,
+    ) -> Result<Vec<(String, i64)>, sqlx::Error> {
+        let rows: Vec<(String, i64)> =
+            sqlx::query_as("SELECT status, COUNT(*) as count FROM action_items GROUP BY status")
+                .fetch_all(&self.pool)
+                .await?;
+
+        Ok(rows)
+    }
+
+    pub async fn get_action_items_count_by_status_with_tenant(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Vec<(String, i64)>, sqlx::Error> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT status, COUNT(*) as count FROM action_items WHERE tenant_id = ? OR tenant_id IS NULL GROUP BY status"
+        )
+        .bind(tenant_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
     }
 }
