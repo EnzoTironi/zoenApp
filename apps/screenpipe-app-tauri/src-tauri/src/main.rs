@@ -1329,7 +1329,7 @@ async fn main() {
             info!("Local data directory: {}", base_dir.display());
 
             // PostHog analytics setup
-            let posthog_api_key = "phc_Bt8GoTBPgkCpDrbaIZzJIEYt0CrJjhBiuLaBck1clce".to_string();
+            let posthog_api_key = std::env::var("POSTHOG_API_KEY").ok();
             let interval_hours = 6;
 
             let path = base_dir.join("store.bin");
@@ -1627,21 +1627,25 @@ async fn main() {
             let email = store.user.email.unwrap_or_default();
 
             if is_analytics_enabled {
-                match start_analytics(
-                    unique_id,
-                    email,
-                    posthog_api_key,
-                    interval_hours,
-                    "http://localhost:3030".to_string(),
-                    base_dir.clone(),
-                    is_analytics_enabled,
-                ) {
-                    Ok(analytics_manager) => {
-                        app.manage(analytics_manager);
+                if let Some(api_key) = posthog_api_key {
+                    match start_analytics(
+                        unique_id,
+                        email,
+                        api_key,
+                        interval_hours,
+                        "http://localhost:3030".to_string(),
+                        base_dir.clone(),
+                        is_analytics_enabled,
+                    ) {
+                        Ok(analytics_manager) => {
+                            app.manage(analytics_manager);
+                        }
+                        Err(e) => {
+                            error!("Failed to start analytics: {}", e);
+                        }
                     }
-                    Err(e) => {
-                        error!("Failed to start analytics: {}", e);
-                    }
+                } else {
+                    warn!("Analytics is enabled but POSTHOG_API_KEY environment variable is not set. Analytics will be disabled.");
                 }
             }
 
