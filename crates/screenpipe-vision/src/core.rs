@@ -42,7 +42,7 @@ where
 
         let mut encoder = JpegEncoder::new_with_quality(&mut cursor, 80);
 
-        // Encode the image as WebP
+        // Encode the image as JPEG
         encoder
             .encode_image(image)
             .map_err(serde::ser::Error::custom)?;
@@ -310,11 +310,8 @@ pub async fn continuous_capture(
         // 4b. Capture windows only for frames that passed the change threshold.
         //     This avoids expensive per-window screenshots + CGWindowList enumeration
         //     on unchanged frames (major CPU savings on multi-monitor setups).
-        let window_images = capture_windows(
-            &monitor,
-            &window_filters,
-            capture_unfocused_windows,
-        ).await;
+        let window_images =
+            capture_windows(&monitor, &window_filters, capture_unfocused_windows).await;
 
         // Track the frame with maximum difference for OCR processing
         if current_diff > max_avg_value {
