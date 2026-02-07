@@ -45,6 +45,7 @@ sentry = { version = "0.36.0", features = ["tracing"] }
 http-cache-reqwest = "0.15.0"
 reqwest = { version = "=0.12.12", features = ["blocking", "multipart", "json"] }
 reqwest-middleware = "0.4.1"
+sqlx = { version = "0.7", features = ["sqlite", "runtime-tokio-native-tls", "chrono", "migrate"] }
 
 
 [patch.crates-io]
@@ -59,10 +60,11 @@ rev = "2023.04.15"
 dynamic = true
 
 [profile.release]
-codegen-units = 1
-lto = true
-opt-level = "s"
+codegen-units = 16
+lto = "thin"
+opt-level = 3
 strip = true
+panic = "abort"
 
 # Fast local release builds: cargo build --profile release-dev
 # ~3-5x faster than full release, still optimized for testing

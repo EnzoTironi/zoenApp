@@ -7,6 +7,7 @@
 
 # Test binary, built with `cargo test`
 *.test
+.next
 
 # Rust/Cargo specific files
 *target
